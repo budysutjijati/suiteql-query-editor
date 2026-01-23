@@ -11,7 +11,7 @@
  *
  * A modern utility for running SuiteQL queries in NetSuite.
  *
- * Version: 2026.01
+ * Version: 2026.02
  *
  * License: MIT
  * Copyright (c) 2021-2026 Timothy Dietrich
@@ -45,6 +45,19 @@
  * ============================================================================
  * History
  * ============================================================================
+ *
+ * 2026.02 - Budy Sutjijati
+ * - Added multi-account remote SuiteQL execution support
+ *   - Allows queries to be executed against configured external NetSuite accounts
+ *   - Remote accounts defined via script parameter configuration
+ *   - Unified execution path for local and remote queries
+ * - Enhanced execution transparency with explicit Local vs Remote context
+ *   - Displays execution origin in results metadata
+ *   - Shows account description and account ID for each query run
+ *   - Persists across view changes, history reloads, and keyboard execution
+ * - Improved Run toolbar to support multi-target execution
+ *   - Added Run dropdown for selecting execution account
+ *   - Preserves existing Run behavior and keyboard shortcuts
  *
  * 2026.01 - Tim Dietrich
  * - Complete UI modernization with SQL Studio-inspired design
@@ -148,7 +161,7 @@
  */
 const CONFIG = Object.freeze({
     /** Application version */
-    VERSION: '2026.01',
+    VERSION: '2026.02',
 
     /** Enable DataTables for enhanced table functionality */
     DATATABLES_ENABLED: true,
@@ -208,11 +221,26 @@ define([
     'N/render',
     'N/runtime',
     'N/ui/serverWidget',
-    'N/url'
-], (file, https, log, query, record, render, runtime, serverWidget, url) => {
+    'N/url',
+    'oauth',
+    'secret'
+], (file, https, log, query, record, render, runtime, serverWidget, url, oauth, secret) => {
 
     // Store module references
-    modules = { file, https, log, query, record, render, runtime, serverWidget, url };
+    modules = { file, https, log, query, record, render, runtime, serverWidget, url, oauth, secret };
+
+    const remoteAccounts = (() => {
+        try {
+            const param = modules.runtime.getCurrentScript().getParameter({
+                name: 'custscript_il_suiteql_accounts'
+            });
+            return param ? JSON.parse(param) : [];
+        } catch (e) {
+            modules.log.error({ title: 'Remote Accounts JSON Error', details: e });
+            return [];
+        }
+    })();
+
 
     return {
         /**
@@ -226,10 +254,37 @@ define([
                 returnExternalURL: false
             });
 
+            const scriptParam = modules.runtime.getCurrentScript().getParameter({
+                name: 'custscript_il_suiteql_accounts'
+            });
+
+            let remoteAccounts = [];
+
+            try {
+                remoteAccounts = scriptParam ? JSON.parse(scriptParam) : [];
+            } catch (e) {
+                modules.log.error({ title: 'Invalid JSON in custscript_il_suiteql_accounts', details: e });
+                remoteAccounts = [];
+            }
+
+            // Extract current account ID
+            const currentAccountId = modules.runtime.accountId?.toLowerCase();
+
+            remoteAccounts = remoteAccounts.filter(acc => {
+                const accountId = (acc.account || '').toLowerCase();
+
+                modules.log.debug('account', {
+                    account: accountId,
+                    currentAccountId: currentAccountId
+                });
+
+                return accountId !== currentAccountId;
+            });
+
             if (context.request.method === 'POST') {
                 handlePostRequest(context, scriptUrl);
             } else {
-                handleGetRequest(context, scriptUrl);
+                handleGetRequest(context, scriptUrl, remoteAccounts, currentAccountId);
             }
         }
     };
@@ -243,8 +298,18 @@ define([
  * Handles GET requests - renders the main UI or specific views.
  * @param {Object} context - The request/response context
  * @param {string} scriptUrl - The script URL for AJAX calls
+ * @param {Array<Object>} remoteAccounts
+ *        List of configured remote NetSuite accounts parsed from the
+ *        `custscript_il_suiteql_accounts` script parameter.
+ *        Each entry contains metadata such as description, account ID,
+ *        and execution URL, and is injected into the client at page load.
+ *
+ * @param {string} currentAccountId
+ *        Account ID of the current NetSuite environment (e.g. sandbox or
+ *        production). Used by the client to resolve and label local query
+ *        execution context.
  */
-function handleGetRequest(context, scriptUrl) {
+function handleGetRequest(context, scriptUrl, remoteAccounts, currentAccountId) {
     const params = context.request.parameters;
 
     if (params.function === 'tablesReference') {
@@ -269,7 +334,7 @@ function handleGetRequest(context, scriptUrl) {
         label: 'HTML'
     });
 
-    htmlField.defaultValue = generateMainHtml(scriptUrl);
+    htmlField.defaultValue = generateMainHtml(scriptUrl, remoteAccounts, currentAccountId);
     context.response.writePage(form);
 }
 
@@ -316,6 +381,7 @@ function handlePostRequest(context, scriptUrl) {
  * @param {Object} context - The request/response context
  * @param {Object} payload - The request payload containing query details
  */
+/*
 function executeQuery(context, payload) {
     let responsePayload;
 
@@ -323,6 +389,9 @@ function executeQuery(context, payload) {
         const beginTime = Date.now();
         let records = [];
         let sqlToExecute = payload.query + '\n';
+
+        log.debug('payload', payload);
+        log.debug('sqlToExecute', sqlToExecute);
 
         // Process virtual views if enabled
         if (payload.viewsEnabled && CONFIG.QUERY_FOLDER_ID) {
@@ -363,6 +432,103 @@ function executeQuery(context, payload) {
 
     context.response.write(JSON.stringify(responsePayload, null, 2));
 }
+*/
+
+function executeQuery(context, payload) {
+    let responsePayload;
+
+    try {
+        if (payload.remoteUrl) {
+            const match = payload.remoteUrl.match(/^https:\/\/(.*?)\./);
+            const subdomain = match ? match[1] : null;
+            if (!subdomain) {
+                throw new Error('Invalid remoteUrl format: unable to extract subdomain');
+            }
+
+            const realmKey = subdomain.replace('-', '_').toUpperCase();
+
+            // Match against realm in secret config
+            const config = modules.secret.find((entry) => entry.realm === realmKey);
+            if (!config) {
+                throw new Error('No credentials found for remote account with realm: ' + realmKey);
+            }
+
+            const auth = modules.oauth.OAuth({
+                realm: config.realm,
+                consumer: {
+                    key: config.consumer.key,
+                    secret: config.consumer.secret
+                },
+                signature_method: 'HMAC-SHA256',
+                hash_function: modules.oauth.sha256
+            });
+
+            const headers = modules.oauth.getHeaders({
+                url: payload.remoteUrl,
+                method: 'POST',
+                tokenKey: config.token.id,
+                tokenSecret: config.token.secret
+            }, auth);
+
+            headers['Content-Type'] = 'application/json';
+
+            const response = modules.https.request({
+                method: 'POST',
+                url: payload.remoteUrl,
+                headers: headers,
+                body: JSON.stringify(payload)
+            });
+
+            responsePayload = JSON.parse(response.body);
+
+        } else {
+            const beginTime = Date.now();
+            let records = [];
+            let sqlToExecute = payload.query + '\n';
+
+            modules.log.debug('payload', payload);
+            modules.log.debug('sqlToExecute', sqlToExecute);
+
+            if (payload.viewsEnabled && CONFIG.QUERY_FOLDER_ID) {
+                sqlToExecute = processVirtualViews(sqlToExecute);
+            }
+
+            if (payload.paginationEnabled) {
+                records = executePaginatedQuery(sqlToExecute, payload.rowBegin, payload.rowEnd);
+            } else {
+                records = modules.query.runSuiteQL({
+                    query: sqlToExecute,
+                    params: []
+                }).asMappedResults();
+            }
+
+            const elapsedTime = Date.now() - beginTime;
+
+            responsePayload = {
+                records,
+                elapsedTime,
+                rowCount: records.length
+            };
+
+            if (payload.returnTotals && records.length > 0) {
+                const countSql = `SELECT COUNT(*) AS TotalRecordCount FROM (${sqlToExecute})`;
+                const countResult = modules.query.runSuiteQL({
+                    query: countSql,
+                    params: []
+                }).asMappedResults();
+                responsePayload.totalRecordCount = countResult[0]?.totalrecordcount || 0;
+            }
+        }
+
+    } catch (e) {
+        modules.log.error({ title: 'Query Execution Error', details: e });
+        responsePayload = { error: { message: e.message, name: e.name } };
+    }
+
+    context.response.write(JSON.stringify(responsePayload, null, 2));
+}
+
+
 
 /**
  * Executes a paginated query with ROWNUM support.
@@ -976,10 +1142,18 @@ function renderTablesReference(context, scriptUrl) {
 
 /**
  * Generates the main application HTML.
+ *
  * @param {string} scriptUrl - The script URL for AJAX calls
+ * @param {Array<Object>} remoteAccounts
+ *        List of configured remote NetSuite accounts parsed from the
+ *        `custscript_il_suiteql_accounts` script parameter.
+ * @param {string} currentAccountId
+ *        Account ID of the current NetSuite environment (sandbox or
+ *        production), used to resolve local execution context.
  * @returns {string} Complete HTML for the application
+ *
  */
-function generateMainHtml(scriptUrl) {
+function generateMainHtml(scriptUrl, remoteAccounts, currentAccountId) {
     return `
         <!DOCTYPE html>
         <html lang="en" data-bs-theme="light">
@@ -991,9 +1165,9 @@ function generateMainHtml(scriptUrl) {
         </head>
         <body>
             ${generateToastContainer()}
-            ${generateMainLayout(scriptUrl)}
+            ${generateMainLayout(scriptUrl, remoteAccounts)}
             ${generateModals()}
-            ${generateClientScript(scriptUrl)}
+            ${generateClientScript(scriptUrl, remoteAccounts, currentAccountId)}
         </body>
         </html>
     `;
@@ -3043,7 +3217,7 @@ function generateToastContainer() {
  * @param {string} scriptUrl - The script URL
  * @returns {string} HTML for main layout
  */
-function generateMainLayout(scriptUrl) {
+function generateMainLayout(scriptUrl, remoteAccounts) {
     return `
         <div class="sqt-app">
             <div class="sqt-main">
@@ -3053,8 +3227,9 @@ function generateMainLayout(scriptUrl) {
                     <button type="button" class="sqt-history-float-btn" onclick="SQT.toggleSidebar()" title="Toggle query history">
                         <i class="bi bi-clock-history"></i>
                     </button>
-
-                    ${generateToolbar(scriptUrl)}
+                    
+                   
+                    ${generateToolbar(scriptUrl, remoteAccounts)}
 
                     <!-- Natural Language Query Bar -->
                     <div class="sqt-nl-bar" id="nlQueryBar">
@@ -3202,7 +3377,7 @@ function generateSidebar() {
  * @param {string} scriptUrl - The script URL
  * @returns {string} HTML for toolbar
  */
-function generateToolbar(scriptUrl) {
+function generateToolbar(scriptUrl, remoteAccounts) {
     const localLibraryButtons = CONFIG.QUERY_FOLDER_ID ? `
         <button type="button" class="sqt-btn sqt-btn-secondary sqt-btn-sm" onclick="SQT.showLocalLibrary()">
             <i class="bi bi-folder"></i>
@@ -3224,10 +3399,28 @@ function generateToolbar(scriptUrl) {
     return `
         <div class="sqt-toolbar">
             <div class="sqt-toolbar-group">
-                <button type="button" class="sqt-btn sqt-btn-primary sqt-btn-sm" onclick="SQT.runQuery()" id="runButton">
-                    <i class="bi bi-play-fill"></i>
-                    <span>Run</span>
-                </button>
+            
+                <div class="sqt-toolbar-dropdown-wrapper" id="toolbarRun">
+                    <button type="button" class="sqt-btn sqt-btn-primary sqt-btn-sm sqt-btn-dropdown"
+                        onclick="SQT.toggleRunDropdown()" title="Run Query" id="runButton">
+                        <i class="bi bi-play-fill"></i>
+                        <span>Run</span>
+                        <i class="bi bi-chevron-down"></i>
+                    </button>
+                    <div class="sqt-toolbar-dropdown" id="runDropdown">
+                        <div class="sqt-toolbar-dropdown-item" onclick="SQT.runQuery(null); SQT.closeAllDropdowns();">
+                            <i class="bi bi-database-check"></i>
+                            <span>This Account</span>
+                        </div>
+                        ${remoteAccounts.map(acc =>
+        `<div class="sqt-toolbar-dropdown-item" onclick="SQT.runQuery('${acc.url}'); SQT.closeAllDropdowns();">
+                            <i class="bi bi-database-check"></i>
+                            <span>${acc.description}<br><small>${acc.account}</small></span>
+                        </div>`
+    ).join('')}
+                    </div>
+                </div>
+
                 <button type="button" class="sqt-btn sqt-btn-secondary sqt-btn-sm" onclick="SQT.formatQuery()" id="toolbarFormat">
                     <i class="bi bi-code-slash"></i>
                     <span>Format</span>
@@ -3966,12 +4159,16 @@ function generateModals() {
  * @param {string} scriptUrl - The script URL for AJAX calls
  * @returns {string} JavaScript in a script tag
  */
-function generateClientScript(scriptUrl) {
+function generateClientScript(scriptUrl, remoteAccounts, currentAccountId) {
     return `
         <script>
         /**
          * SuiteQL Query Tool - Client-Side Application
          */
+         
+        const REMOTE_ACCOUNTS = ${JSON.stringify(remoteAccounts)};
+        const CURRENT_ACCOUNT_ID = '${currentAccountId.toUpperCase()}';
+    
         const SQT = (function() {
             'use strict';
 
@@ -4002,8 +4199,29 @@ function generateClientScript(scriptUrl) {
                 lastFailedQuery: null,
                 lastError: null,
                 // Last executed query for AI results chat
-                lastExecutedQuery: null
+                lastExecutedQuery: null,
+                
+                // =============================================================
+                // Account context (injected at page load)
+                //
+                // - Used to resolve execution origin (Local vs Remote)
+                // - Immutable for the lifetime of the page
+                // - Sourced from server-side Suitelet configuration
+                // =============================================================
+                remoteAccounts: REMOTE_ACCOUNTS,                // List of configured remote NetSuite accounts
+                currentAccountId: CURRENT_ACCOUNT_ID,           // Account ID of the current NetSuite instance
+                currentAccountDescription: CURRENT_ACCOUNT_ID   // Human-readable label (defaults to ID)
             };
+            
+            // Normalize once
+            state.currentAccountId = state.currentAccountId.toUpperCase();
+            
+            // Resolve description once
+            const localAccount = state.remoteAccounts.find(
+                acc => String(acc.account).toUpperCase() === state.currentAccountId
+            );
+            
+            state.currentAccountDescription = localAccount?.description || 'This Account';
 
             const CONFIG = {
                 SCRIPT_URL: '${scriptUrl}',
@@ -4116,7 +4334,8 @@ function generateClientScript(scriptUrl) {
                         { id: 'optionsPanel', toggleSelector: '[onclick*="toggleOptions"]' },
                         { id: 'undoHistoryDropdown', toggleSelector: '[onclick*="showUndoHistory"]' },
                         { id: 'aiDropdown', toggleSelector: '[onclick*="toggleAIDropdown"]' },
-                        { id: 'moreDropdown', toggleSelector: '[onclick*="toggleMoreDropdown"]' }
+                        { id: 'moreDropdown', toggleSelector: '[onclick*="toggleMoreDropdown"]' },
+                        { id: 'runDropdown', toggleSelector: '[onclick*="toggleRunDropdown"]' } 
                     ];
 
                     dropdownConfigs.forEach(config => {
@@ -4128,7 +4347,7 @@ function generateClientScript(scriptUrl) {
                     });
                 });
             }
-
+            
             function initEditor() {
                 const textarea = document.getElementById('queryEditor');
                 state.editor = CodeMirror.fromTextArea(textarea, {
@@ -5274,7 +5493,7 @@ ORDER BY
             // QUERY EXECUTION
             // =================================================================
 
-            async function runQuery() {
+            async function runQuery(remoteUrl = null) {
                 let query = getQueryToRun();
 
                 if (!query.trim()) {
@@ -5309,7 +5528,8 @@ ORDER BY
                             rowEnd: options.rowEnd,
                             paginationEnabled: options.paginationEnabled,
                             viewsEnabled: options.viewsEnabled,
-                            returnTotals: options.returnTotals
+                            returnTotals: options.returnTotals,
+                            remoteUrl: remoteUrl
                         })
                     });
 
@@ -5318,6 +5538,47 @@ ORDER BY
                     if (data.error) {
                         showError(data.error.message || data.error);
                     } else {
+                                       
+                        // -----------------------------------------------------------------
+                        // Resolve execution context (Local vs Remote)
+                        //
+                        // Responsibility:
+                        // - Attach a clear, immutable execution context to the result payload
+                        // - This context is consumed by the results renderer (renderResults)
+                        // - Must be derived here, where execution identity (remoteUrl) is known
+                        //
+                        // Design notes:
+                        // - \`remoteUrl\` is the execution *identity* for remote queries
+                        // - Presentation metadata (description / account ID) is resolved from
+                        //   pre-injected, immutable client-side configuration (state.remoteAccounts)
+                        // - Local account context is resolved once at bootstrap and reused here
+                        // - Do NOT normalize or resolve configuration in render or execution paths
+                        // -----------------------------------------------------------------
+                        if (remoteUrl) {
+                            // Remote execution:
+                            // Look up the remote account metadata using the execution URL.
+                            // This ensures consistent labeling across all execution entry points
+                            // (toolbar, dropdown, keyboard shortcuts, validation, history replay).
+                            const remote = state.remoteAccounts.find(acc => acc.url === remoteUrl);
+                    
+                            data.executionContext = {
+                                type: 'remote',
+                                accountDescription: remote?.description || 'Unknown Remote',
+                                accountId: remote?.account || 'Unknown'
+                            };
+                        } else {
+                            
+                            // Local execution:
+                            // Use pre-resolved local account context from bootstrap state.
+                            // This avoids repeated lookups and guarantees consistency for
+                            // all local executions during the page lifetime.
+                            data.executionContext = {
+                                type: 'local',
+                                accountDescription: state.currentAccountDescription,
+                                accountId: state.currentAccountId
+                            };
+                        }
+                    
                         data.cacheMissForced = disableCache;
                         state.results = data;
                         state.lastExecutedQuery = query;
@@ -5418,7 +5679,7 @@ ORDER BY
                     text.textContent = 'Running query...';
                 } else {
                     btn.disabled = false;
-                    btn.innerHTML = '<i class="bi bi-play-fill"></i><span>Run</span>';
+                    btn.innerHTML = '<i class="bi bi-play-fill"></i><span>Run</span> <i class="bi bi-chevron-down"></i>';
                     dot.classList.remove('running');
                     text.textContent = 'Ready';
                 }
@@ -5489,6 +5750,11 @@ ORDER BY
                                 <i class="bi bi-clock"></i>
                                 <span>\${data.elapsedTime}ms</span>
                                 \${data.cacheMissForced ? '<span class="sqt-cache-miss-badge" title="Cache miss was forced for this query">uncached</span>' : ''}
+                            </div>    
+                            <div class="sqt-results-info-item">
+                                <i class="bi bi-diagram-3"></i>
+                                <span>\${data.executionContext.type === 'remote' ? 'Remote' : 'Local'}: \${escapeHtml(data.executionContext.accountDescription)} (\${escapeHtml(data.executionContext.accountId)})
+                                </span>
                             </div>
                         </div>
                         <div class="sqt-results-actions">
@@ -5916,7 +6182,17 @@ ORDER BY
                 const dropdown = document.getElementById('aiDropdown');
                 dropdown.classList.toggle('show');
             }
-
+            
+            // function toggleRunDropdown() {
+            //     closeAllDropdowns('runDropdown');
+            //     document.getElementById('runDropdown')?.classList.toggle('show');
+            // }
+            
+            function toggleRunDropdown() {
+                closeAllDropdowns('runDropdown'); // ✅ tells it NOT to close itself
+                const dropdown = document.getElementById('runDropdown');
+                dropdown?.classList.toggle('show');
+            }
             function toggleMoreDropdown() {
                 closeAllDropdowns('moreDropdown');
                 const dropdown = document.getElementById('moreDropdown');
@@ -5924,7 +6200,7 @@ ORDER BY
             }
 
             function closeAllDropdowns(except = null) {
-                const dropdowns = ['aiDropdown', 'moreDropdown', 'optionsPanel', 'undoHistoryDropdown'];
+                const dropdowns = ['aiDropdown', 'moreDropdown', 'optionsPanel', 'undoHistoryDropdown', 'runDropdown'];
                 dropdowns.forEach(id => {
                     if (id !== except) {
                         const el = document.getElementById(id);
@@ -7587,6 +7863,7 @@ Please suggest:
                 toggleResultsMaximized,
                 toggleOptions,
                 toggleAIDropdown,
+                toggleRunDropdown,
                 toggleMoreDropdown,
                 closeAllDropdowns,
                 updateOptions,
